@@ -2,17 +2,19 @@ name: Build APK
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    name: Assemble Release APK
+    name: Assemble APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -26,70 +28,49 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Gradle
-        uses: gradle/gradle-build-action@v3
+      - name: Setup Gradle 8.5
+        uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 8.5
 
-      - name: Cache Gradle packages
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew || true
+      - name: Verify sources
+        run: |
+          echo "=== java files ==="
+          find app/src -name "*.java" | wc -l
+          echo "=== build files ==="
+          ls -la *.gradle gradle.properties app/build.gradle
 
       - name: Build Debug APK
-        run: gradle assembleDebug --stacktrace --no-daemon
+        run: gradle assembleDebug --no-daemon --stacktrace
 
-      - name: Build Release APK (unsigned)
-        run: gradle assembleRelease --stacktrace --no-daemon
-        continue-on-error: true
-
-      - name: Locate APKs
-        id: find_apk
+      - name: Find APK
+        id: apk
         run: |
-          echo "--- build outputs ---"
-          find app/build/outputs -name "*.apk" -type f | tee apk_list.txt
-          DEBUG_APK=$(find app/build/outputs -name "app-debug.apk" -type f | head -1)
-          if [ -n "$DEBUG_APK" ]; then
-            cp "$DEBUG_APK" LunarCard-debug.apk
-            echo "debug_apk=LunarCard-debug.apk" >> $GITHUB_OUTPUT
+          APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          if [ -n "$APK" ]; then
+            cp "$APK" LunarCard.apk
             echo "found=true" >> $GITHUB_OUTPUT
+            ls -lh LunarCard.apk
           else
             echo "found=false" >> $GITHUB_OUTPUT
           fi
-          ls -lh *.apk 2>/dev/null || true
 
-      - name: Upload Debug APK
-        if: steps.find_apk.outputs.found == 'true'
+      - name: Upload APK
+        if: steps.apk.outputs.found == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: LunarCard-debug-apk
-          path: LunarCard-debug.apk
+          name: LunarCard-apk
+          path: LunarCard.apk
           retention-days: 90
 
-      - name: Upload all build outputs
-        if: always()
+      - name: Upload build report on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-reports
+          name: build-failure-report
           path: |
-            app/build/outputs/
             app/build/reports/
-          retention-days: 14
+            app/build/outputs/logs/
+          retention-days: 7
           if-no-files-found: ignore
-
-      - name: Create Release on tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: LunarCard-debug.apk
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

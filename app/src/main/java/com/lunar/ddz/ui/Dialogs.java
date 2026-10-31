@@ -22,9 +22,9 @@ public final class Dialogs {
 
     /** 弹窗按钮定义 */
     public static final class Btn {
-        final String text;
-        final int style;
-        final Runnable action;
+        public final String text;
+        public final int style;
+        public final Runnable action;
         public Btn(String text, int style, Runnable action) {
             this.text = text;
             this.style = style;

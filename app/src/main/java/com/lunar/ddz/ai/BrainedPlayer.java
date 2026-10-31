@@ -382,10 +382,15 @@ public final class BrainedPlayer {
     private int countControl(HandSplitter.Result sp) {
         int n = 0;
         for (List<Card> g : sp.groups) {
-            if (g.isEmpty()) continue;
+            if (g == null || g.isEmpty()) continue;
+            // 炸弹（4 张同点）
+            if (g.size() == 4 && g.get(0).rank == g.get(3).rank) {
+                n += 2;
+                continue;
+            }
+            // 2 和 王 都算控制牌
             Card first = g.get(0);
             if (first.rank >= 15) n++;
-            else if (g.size() == 4 && g.get(0).rank == g.get(3).rank) n += 2;
         }
         return n;
     }
