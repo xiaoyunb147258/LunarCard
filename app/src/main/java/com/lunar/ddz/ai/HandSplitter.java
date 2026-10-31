@@ -89,10 +89,10 @@ public final class HandSplitter {
                 cnt[rank] -= 3;
 
                 List<Card> kicker = pickLowestSingle(pool, cnt, rank);
-                if (kicker != null) {
-                    triple.add(kicker);
-                    pool.remove(kicker);
-                    cnt[kicker.rank]--;
+                if (kicker != null && !kicker.isEmpty()) {
+                    triple.addAll(kicker);
+                    pool.removeAll(kicker);
+                    cnt[kicker.get(0).rank]--;
                 }
                 r.groups.add(triple);
             }

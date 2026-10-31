@@ -58,6 +58,7 @@ public final class Deck {
 
     /** 从 hand 中移除 remove 里的牌；若有不存在的牌返回 false */
     public static boolean removeAll(List<Card> hand, List<Card> remove) {
+        if (hand == null || remove == null) return false;
         boolean ok = true;
         for (Card c : remove) {
             if (!hand.remove(c)) ok = false;
@@ -74,13 +75,13 @@ public final class Deck {
         return true;
     }
 
-    /** 按点数从 hand 里挑出 count 张 rank 的牌 */
+    /** 按点数从 hand 里挑出 count 张 rank 的牌；不足时返回空列表（不返回 null） */
     public static List<Card> takeRank(List<Card> sortedDesc, int rank, int count) {
         List<Card> out = new ArrayList<Card>(count);
         for (Card c : sortedDesc) {
             if (c.rank == rank && out.size() < count) out.add(c);
         }
-        return out.size() == count ? out : null;
+        return out;
     }
 
     /** 把牌转成短字符串，如 "♠A ♥2 大王" */
