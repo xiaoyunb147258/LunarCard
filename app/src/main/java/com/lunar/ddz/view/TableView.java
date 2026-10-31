@@ -5,6 +5,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.RadialGradient;
 import android.graphics.RectF;
 import android.graphics.Shader;
@@ -14,7 +15,6 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 
 import com.lunar.ddz.core.Card;
-import com.lunar.ddz.core.Combo;
 import com.lunar.ddz.core.Deck;
 import com.lunar.ddz.core.GameState;
 import com.lunar.ddz.ui.CardPainter;
@@ -22,21 +22,27 @@ import com.lunar.ddz.ui.Theme;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 
 /**
- * 牌桌主视图。所有游戏画面均在此绘制。
+ * 牌桌主视图 —— 横屏实体牌桌。
  *
- * 性能设计：
- *  - SurfaceView + 独立渲染线程，恒定 60fps
- *  - 所有 Paint/RectF 复用，绘制循环内零分配
- *  - 卡牌位置每帧计算，不缓存 RectF 列表
+ * 布局（横屏）：
+ *   ┌────────────────────────────────────────┐
+ *   │                 底牌                   │
+ *   │  [左家头像]                [右家头像]  │
+ *   │      左家出牌        右家出牌          │
+ *   │            我出牌区                    │
+ *   │                                        │
+ *   │  ══════════ 我的手牌 ══════════         │
+ *   └────────────────────────────────────────┘
  */
 public class TableView extends SurfaceView implements SurfaceHolder.Callback, Runnable {
 
     public interface Listener {
         void onCardTapped(int index);
-        void onHandScrolled(float dx);
         void onEmptyTapped();
+        void onAnimationSettled();
     }
 
     private static final int FPS = 60;
@@ -48,84 +54,73 @@ public class TableView extends SurfaceView implements SurfaceHolder.Callback, Ru
     private final CardPainter painter;
     private Theme theme;
 
-    // 绘制资源
+    // ── 复用绘制资源 ──
     private final Paint bgPaint = new Paint();
-    private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final RectF rect = new RectF();
-    private final RectF rect2 = new RectF();
+    private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint txt = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final RectF rc = new RectF();
+    private final RectF rc2 = new RectF();
+    private final Path path = new Path();
 
-    private static final Typeface BOLD = Typeface.create("sans-serif-medium", Typeface.BOLD);
-    private static final Typeface NORMAL = Typeface.create("sans-serif", Typeface.NORMAL);
+    private static final Typeface F_BOLD =
+            Typeface.create("sans-serif-medium", Typeface.BOLD);
+    private static final Typeface F_NORMAL =
+            Typeface.create("sans-serif", Typeface.NORMAL);
 
-    // ---- 数据 ----
+    // ── 状态 ──
     private GameState state;
-
-    /** 我的手牌（用于绘制） */
-    private final List<Card> myHand = new ArrayList<Card>();
-    /** 选中索引 */
+    private final List<Card> myHand = new ArrayList<Card>(20);
     private final List<Integer> selected = new ArrayList<Integer>();
-
-    /** 出牌区（每位玩家） */
-    private final List<Card>[] tableCards = new List[3];
-    /** 气泡文字 */
-    private final String[] bubbles = new String[3];
-    private final float[] bubbleAlpha = new float[3];
-    private final long[] bubbleTime = new long[3];
-
-    /** 剩余张数 */
-    private final int[] remain = new int[3];
-    /** 地主标记 */
-    private int landlord = -1;
-    /** 当前回合 */
-    private int activeSeat = -1;
-
-    /** 底牌 */
-    private final List<Card> bottom = new ArrayList<Card>();
-    private boolean bottomRevealed;
-
-    /** 我的手牌布局参数 */
-    private float cardW, cardH, stepX, liftY, handTopY;
     private final List<RectF> handRects = new ArrayList<RectF>(20);
 
-    private Listener listener;
+    private final List<Card>[] tableCards = new List[3];
+    private final String[] bubbles = new String[3];
+    private final float[] bubbleA = new float[3];
+    private final long[] bubbleAt = new long[3];
+    private final float[] thinkA = new float[3];
 
-    // ---- 动画 ----
-    private long lastFrame = 0;
+    private final int[] remain = new int[3];
+    private int landlord = -1;
+    private int activeSeat = -1;
+
+    private final List<Card> bottom = new ArrayList<Card>(3);
+    private boolean bottomRevealed = false;
+
+    // ── 我的手牌布局 ──
+    private float cardW, cardH, stepX, liftY, handTopY;
+
+    // ── 毛毡程序纹理（一次性生成，缓存） ──
+    private int[] feltNoise;
+    private int feltNoiseW, feltNoiseH;
+
+    private Listener listener;
+    private final Random rnd = new Random(20240101L);
 
     public TableView(Context ctx) {
         super(ctx);
-        this.theme = Theme.EMERALD;
+        this.theme = Theme.GREEN;
         this.painter = new CardPainter(theme);
-
         getHolder().addCallback(this);
         setZOrderOnTop(false);
 
         for (int i = 0; i < 3; i++) {
             tableCards[i] = new ArrayList<Card>();
-            bubbles[i] = null;
         }
-
-        bgPaint.setStyle(Paint.Style.FILL);
-        paint.setAntiAlias(true);
     }
 
-    public void setListener(Listener l) {
-        this.listener = l;
-    }
+    public void setListener(Listener l) { this.listener = l; }
 
     public void setTheme(Theme t) {
         this.theme = t;
         this.painter.setTheme(t);
+        feltNoise = null;   // 主题变了，纹理重生成
     }
 
     // ============================================================
-    //                 外部数据接口
+    //                      数据接口
     // ============================================================
 
-    public void bindState(GameState gs) {
-        this.state = gs;
-    }
+    public void bindState(GameState gs) { this.state = gs; }
 
     public void setHand(List<Card> cards) {
         myHand.clear();
@@ -135,17 +130,9 @@ public class TableView extends SurfaceView implements SurfaceHolder.Callback, Ru
         layoutHand();
     }
 
-    public void setRemain(int seat, int n) {
-        remain[seat] = n;
-    }
-
-    public void setLandlord(int seat) {
-        this.landlord = seat;
-    }
-
-    public void setActiveSeat(int seat) {
-        this.activeSeat = seat;
-    }
+    public void setRemain(int seat, int n) { remain[seat] = n; }
+    public void setLandlord(int seat) { this.landlord = seat; }
+    public void setActiveSeat(int seat) { this.activeSeat = seat; }
 
     public void setBottom(List<Card> cards, boolean reveal) {
         bottom.clear();
@@ -164,8 +151,8 @@ public class TableView extends SurfaceView implements SurfaceHolder.Callback, Ru
 
     public void showBubble(int seat, String s) {
         bubbles[seat] = s;
-        bubbleAlpha[seat] = 1f;
-        bubbleTime[seat] = System.currentTimeMillis();
+        bubbleA[seat] = 1f;
+        bubbleAt[seat] = System.currentTimeMillis();
     }
 
     public List<Card> getSelectedCards() {
@@ -181,13 +168,12 @@ public class TableView extends SurfaceView implements SurfaceHolder.Callback, Ru
         layoutHand();
     }
 
-    /** 按牌对象选中（用于「提示」功能） */
     public void selectCards(List<Card> cards) {
         selected.clear();
         if (cards != null) {
-            for (Card target : cards) {
+            for (Card t : cards) {
                 for (int i = 0; i < myHand.size(); i++) {
-                    if (myHand.get(i).id == target.id
+                    if (myHand.get(i).id == t.id
                             && !selected.contains(Integer.valueOf(i))) {
                         selected.add(Integer.valueOf(i));
                         break;
@@ -198,60 +184,52 @@ public class TableView extends SurfaceView implements SurfaceHolder.Callback, Ru
         layoutHand();
     }
 
-    public boolean isHandReady() {
-        return handRects.size() == myHand.size();
-    }
+    public void refreshLayout() { layoutHand(); }
 
     // ============================================================
-    //                 渲染线程
+    //                      渲染线程
     // ============================================================
 
     @Override
-    public void surfaceCreated(SurfaceHolder holder) {
+    public void surfaceCreated(SurfaceHolder h) {
         running = true;
-        renderThread = new Thread(this, "TableView-Render");
-        renderThread.setPriority(Thread.NORM_PRIORITY + 1);
+        renderThread = new Thread(this, "TableView");
         renderThread.start();
     }
 
     @Override
-    public void surfaceChanged(SurfaceHolder holder, int f, int w, int h) {
+    public void surfaceChanged(SurfaceHolder h, int f, int w, int hh) {
         layoutHand();
     }
 
     @Override
-    public void surfaceDestroyed(SurfaceHolder holder) {
+    public void surfaceDestroyed(SurfaceHolder h) {
         running = false;
         boolean retry = true;
         while (retry) {
             try {
                 if (renderThread != null) renderThread.join();
                 retry = false;
-            } catch (InterruptedException ignored) {
-                // 重试
-            }
+            } catch (InterruptedException ignored) {}
         }
     }
 
     @Override
     public void run() {
         while (running) {
-            long start = System.currentTimeMillis();
+            long t0 = System.currentTimeMillis();
             Canvas c = null;
             SurfaceHolder h = getHolder();
             try {
                 c = h.lockCanvas();
-                if (c != null) {
-                    drawFrame(c);
-                }
+                if (c != null) drawFrame(c);
             } catch (Throwable ignored) {
-                // 忽略绘制异常，避免崩溃
             } finally {
                 if (c != null) {
                     try { h.unlockCanvasAndPost(c); } catch (Throwable ignored) {}
                 }
             }
-            long cost = System.currentTimeMillis() - start;
+            long cost = System.currentTimeMillis() - t0;
             long sleep = FRAME_MS - cost;
             if (sleep > 0) {
                 try { Thread.sleep(sleep); } catch (InterruptedException ignored) {}
@@ -260,306 +238,417 @@ public class TableView extends SurfaceView implements SurfaceHolder.Callback, Ru
     }
 
     // ============================================================
-    //                 绘制
+    //                      主绘制
     // ============================================================
 
     private void drawFrame(Canvas c) {
-        int w = getWidth();
-        int h = getHeight();
+        int w = getWidth(), h = getHeight();
         if (w == 0 || h == 0) return;
 
-        drawBackground(c, w, h);
+        drawTable(c, w, h);
         drawBottomCards(c, w, h);
         drawOpponent(c, GameState.SEAT_LEFT, w, h);
         drawOpponent(c, GameState.SEAT_RIGHT, w, h);
-        drawTableArea(c, w, h);
+        drawCenterPlays(c, w, h);
         drawMyHand(c, w, h);
         drawBubbles(c, w, h);
-        updateAnimations();
+        tickAnimations();
     }
 
-    private void drawBackground(Canvas c, int w, int h) {
-        // 桌面渐变
-        bgPaint.setShader(new LinearGradient(0, 0, 0, h,
-                theme.tableTop, theme.tableBottom, Shader.TileMode.CLAMP));
-        c.drawRect(0, 0, w, h, bgPaint);
-        bgPaint.setShader(null);
+    // ── 桌面：毛毡 + 木框 + 光晕 ──
+    private void drawTable(Canvas c, int w, int h) {
+        float rim = Math.min(w, h) * 0.022f;
 
-        // 中心光晕
-        paint.setShader(new RadialGradient(
-                w * 0.5f, h * 0.42f, w * 0.72f,
-                Theme.alpha(theme.accent, 0.10f), Color.TRANSPARENT,
+        // 木框
+        p.setShader(new LinearGradient(0, 0, 0, h,
+                theme.woodLight, theme.woodDark, Shader.TileMode.CLAMP));
+        c.drawRect(0, 0, w, h, p);
+        p.setShader(null);
+
+        // 毛毡（内嵌）
+        rc.set(rim, rim, w - rim, h - rim);
+        float r = rim * 0.9f;
+        p.setShader(new LinearGradient(0, rim, 0, h - rim,
+                new int[]{theme.feltTop, theme.feltMid, theme.feltBottom},
+                new float[]{0f, 0.55f, 1f}, Shader.TileMode.CLAMP));
+        c.drawRoundRect(rc, r, r, p);
+        p.setShader(null);
+
+        // 毛毡纹理噪点
+        drawFeltNoise(c, rc);
+
+        // 顶部灯光
+        p.setShader(new RadialGradient(
+                w * 0.5f, h * 0.10f, w * 0.78f,
+                Theme.alpha(0xFFFFFF, 0.09f), Color.TRANSPARENT,
                 Shader.TileMode.CLAMP));
-        c.drawRect(0, 0, w, h, paint);
-        paint.setShader(null);
+        c.drawRoundRect(rc, r, r, p);
+        p.setShader(null);
 
         // 四周暗角
-        paint.setShader(new RadialGradient(
-                w * 0.5f, h * 0.48f, w * 0.85f,
-                Color.TRANSPARENT, Theme.alpha(theme.tableVignette, 0.72f),
-                Shader.TileMode.CLAMP));
-        c.drawRect(0, 0, w, h, paint);
-        paint.setShader(null);
+        p.setShader(new RadialGradient(
+                w * 0.5f, h * 0.48f, w * 0.80f,
+                Color.TRANSPARENT, 0x66000000, Shader.TileMode.CLAMP));
+        c.drawRoundRect(rc, r, r, p);
+        p.setShader(null);
+
+        // 木框高光内沿
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(Math.max(1.5f, rim * 0.22f));
+        p.setColor(theme.rimGlow);
+        c.drawRoundRect(rc, r, r, p);
+
+        // 木框外深边
+        p.setStrokeWidth(Math.max(2f, rim * 0.30f));
+        p.setColor(0x66000000);
+        rc2.set(rim * 0.35f, rim * 0.35f, w - rim * 0.35f, h - rim * 0.35f);
+        c.drawRoundRect(rc2, r * 1.2f, r * 1.2f, p);
+        p.setStyle(Paint.Style.FILL);
     }
 
-    /** 底牌展示（顶部中间） */
+    private void drawFeltNoise(Canvas c, RectF area) {
+        if (feltNoise == null) buildFeltNoise();
+        if (feltNoise == null) return;
+        // 用极低透明度的小点模拟织物颗粒（性能友好：少量平铺）
+        p.setStyle(Paint.Style.FILL);
+        int step = 14;
+        int n = 0;
+        for (float y = area.top; y < area.bottom; y += step) {
+            for (float x = area.left + (n % 2) * (step / 2f); x < area.right; x += step) {
+                int idx = ((int) x + (int) y * 7) % feltNoise.length;
+                int col = feltNoise[idx];
+                if ((col & 0xFF) == 0) continue;
+                p.setColor(col);
+                c.drawCircle(x, y, 1.1f, p);
+            }
+            n++;
+        }
+    }
+
+    private void buildFeltNoise() {
+        int count = 4096;
+        feltNoise = new int[count];
+        for (int i = 0; i < count; i++) {
+            int r = rnd.nextInt(100);
+            if (r < 62) {
+                feltNoise[i] = 0x00000000;   // 多数透明
+            } else if (r < 88) {
+                feltNoise[i] = Theme.alpha(theme.feltNoise, 0.22f);   // 亮点
+            } else {
+                feltNoise[i] = 0x12000000;   // 暗点
+            }
+        }
+    }
+
+    // ── 底牌（顶部居中）──
     private void drawBottomCards(Canvas c, int w, int h) {
         if (bottom.isEmpty()) return;
 
-        float cw = w * 0.085f;
+        float cw = Math.min(w, h) * 0.098f;
         float ch = cw / CardPainter.ASPECT;
-        float gap = cw * 0.14f;
-        float totalW = cw * 3 + gap * 2;
-        float startX = (w - totalW) / 2f;
-        float y = h * 0.035f;
+        float gap = cw * 0.16f;
+        float total = cw * 3 + gap * 2;
+        float x0 = (w - total) / 2f;
+        float y = Math.min(w, h) * 0.030f;
+
+        // 底座阴影
+        p.setStyle(Paint.Style.FILL);
+        p.setColor(0x33000000);
+        rc.set(x0 - cw * 0.10f, y - cw * 0.08f,
+                x0 + total + cw * 0.10f, y + ch + cw * 0.10f);
+        c.drawRoundRect(rc, cw * 0.16f, cw * 0.16f, p);
 
         for (int i = 0; i < 3 && i < bottom.size(); i++) {
-            rect.set(startX + i * (cw + gap), y, startX + i * (cw + gap) + cw, y + ch);
+            rc.set(x0 + i * (cw + gap), y, x0 + i * (cw + gap) + cw, y + ch);
             if (bottomRevealed) {
-                painter.drawFace(c, rect, bottom.get(i), 4f, false);
+                painter.drawFace(c, rc, bottom.get(i), cw * 0.10f, false);
             } else {
-                painter.drawBack(c, rect, 4f);
+                painter.drawBack(c, rc, cw * 0.10f);
             }
         }
     }
 
-    /** 左右对手 */
+    // ── 对手（左右）──
     private void drawOpponent(Canvas c, int seat, int w, int h) {
         boolean left = (seat == GameState.SEAT_LEFT);
+        float base = Math.min(w, h);
 
-        // 头像位置
-        float avatarR = w * 0.072f;
-        float cx = left ? avatarR + w * 0.035f : w - avatarR - w * 0.035f;
-        float cy = h * 0.24f;
+        // 头像
+        float ar = base * 0.068f;
+        float cx = left ? (base * 0.115f) : (w - base * 0.115f);
+        float cy = h * 0.30f;
 
-        // 头像圆
-        paint.setShader(null);
-        paint.setStyle(Paint.Style.FILL);
-        paint.setColor(Theme.alpha(theme.panelBg, 0.92f));
-        c.drawCircle(cx, cy, avatarR, paint);
+        // 思考脉冲
+        float pulse = thinkA[seat];
+        if (pulse > 0.01f) {
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(ar * 0.18f);
+            p.setColor(Theme.alpha(theme.accent, 0.55f * pulse));
+            c.drawCircle(cx, cy, ar * (1.10f + 0.16f * (1f - pulse)), p);
+            p.setStyle(Paint.Style.FILL);
+        }
 
-        // 边框（轮到谁，谁高亮）
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(avatarR * (activeSeat == seat ? 0.14f : 0.07f));
-        paint.setColor(activeSeat == seat ? theme.accent : theme.panelBorder);
-        c.drawCircle(cx, cy, avatarR, paint);
-        paint.setStyle(Paint.Style.FILL);
+        // 头像底
+        p.setColor(0xCC000000);
+        c.drawCircle(cx, cy, ar * 1.04f, p);
+        p.setShader(new RadialGradient(cx, cy - ar * 0.3f, ar * 1.2f,
+                0xFF2A3444, 0xFF141A24, Shader.TileMode.CLAMP));
+        c.drawCircle(cx, cy, ar, p);
+        p.setShader(null);
 
-        // 头像内文字：地主/农民
-        textPaint.setTypeface(BOLD);
-        textPaint.setTextAlign(Paint.Align.CENTER);
-        textPaint.setColor(landlord == seat ? theme.accent : theme.textSecondary);
-        textPaint.setTextSize(avatarR * 0.52f);
-        c.drawText(landlord == seat ? "地主" : "农民", cx, cy + avatarR * 0.18f, textPaint);
+        // 头像描边
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(ar * (activeSeat == seat ? 0.15f : 0.075f));
+        p.setColor(activeSeat == seat ? theme.gold : 0x66FFFFFF);
+        c.drawCircle(cx, cy, ar, p);
+        p.setStyle(Paint.Style.FILL);
 
-        // 剩余张数徽标
-        float badgeR = avatarR * 0.46f;
-        float bx = left ? cx + avatarR * 0.72f : cx - avatarR * 0.72f;
-        float by = cy + avatarR * 0.70f;
+        // 身份文字
+        boolean isLord = (landlord == seat);
+        txt.setTypeface(F_BOLD);
+        txt.setTextAlign(Paint.Align.CENTER);
+        txt.setTextSize(ar * 0.46f);
+        txt.setColor(isLord ? theme.gold : 0xFFB9C6D4);
+        c.drawText(isLord ? "地主" : "农民", cx, cy + ar * 0.17f, txt);
 
-        paint.setStyle(Paint.Style.FILL);
-        paint.setColor(remain[seat] <= 2 ? theme.danger
-                : Theme.alpha(theme.panelBg, 0.95f));
-        c.drawCircle(bx, by, badgeR, paint);
+        // 地主王冠
+        if (isLord) {
+            drawCrown(c, cx, cy - ar * 0.52f, ar * 0.52f, theme.gold);
+        }
 
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(badgeR * 0.10f);
-        paint.setColor(theme.panelBorder);
-        c.drawCircle(bx, by, badgeR, paint);
-        paint.setStyle(Paint.Style.FILL);
+        // 剩余张数
+        float br = ar * 0.44f;
+        float bx = left ? cx + ar * 0.74f : cx - ar * 0.74f;
+        float by = cy + ar * 0.74f;
+        boolean low = remain[seat] <= 2;
 
-        textPaint.setTypeface(BOLD);
-        textPaint.setColor(remain[seat] <= 2 ? 0xFFFFFFFF : theme.textPrimary);
-        textPaint.setTextSize(badgeR * 1.05f);
-        c.drawText(String.valueOf(remain[seat]), bx, by + badgeR * 0.36f, textPaint);
+        p.setColor(0xDD000000);
+        c.drawCircle(bx, by, br * 1.10f, p);
+        p.setColor(low ? theme.danger : 0xFF1E2836);
+        c.drawCircle(bx, by, br, p);
 
-        // 场上牌：对手出牌显示在其头像与中心之间
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(br * 0.13f);
+        p.setColor(low ? 0xFFFFDDDD : 0x55FFFFFF);
+        c.drawCircle(bx, by, br, p);
+        p.setStyle(Paint.Style.FILL);
+
+        txt.setTypeface(F_BOLD);
+        txt.setTextSize(br * 1.06f);
+        txt.setColor(low ? 0xFFFFFFFF : 0xFFE8EEF5);
+        c.drawText(String.valueOf(remain[seat]), bx, by + br * 0.37f, txt);
+
+        // 场上出牌
         List<Card> tc = tableCards[seat];
         if (!tc.isEmpty()) {
-            float cw = w * 0.058f;
+            float cw = base * 0.050f;
             float ch = cw / CardPainter.ASPECT;
-            float ov = cw * 0.36f;
+            float ov = cw * 0.40f;
             int n = tc.size();
-            float totalW = cw + ov * (n - 1);
-            float startX = left ? (w * 0.24f) : (w * 0.76f - totalW);
-            float y = h * 0.40f;
+            float tw = cw + ov * (n - 1);
+            float x0 = left ? (cx + ar * 1.35f) : (cx - ar * 1.35f - tw);
+            float y = cy - ch / 2f;
 
             for (int i = 0; i < n; i++) {
-                rect.set(startX + i * ov, y, startX + i * ov + cw, y + ch);
-                painter.drawFace(c, rect, tc.get(i), 3f, false);
+                rc.set(x0 + i * ov, y, x0 + i * ov + cw, y + ch);
+                painter.drawFace(c, rc, tc.get(i), cw * 0.09f, false);
             }
         }
     }
 
-    /** 中央出牌区（我方） */
-    private void drawTableArea(Canvas c, int w, int h) {
+    private void drawCrown(Canvas c, float cx, float cy, float w, int color) {
+        p.setStyle(Paint.Style.FILL);
+        p.setColor(color);
+        path.reset();
+        float h = w * 0.62f;
+        path.moveTo(cx - w * 0.5f, cy + h * 0.5f);
+        path.lineTo(cx - w * 0.5f, cy - h * 0.15f);
+        path.lineTo(cx - w * 0.22f, cy + h * 0.12f);
+        path.lineTo(cx, cy - h * 0.5f);
+        path.lineTo(cx + w * 0.22f, cy + h * 0.12f);
+        path.lineTo(cx + w * 0.5f, cy - h * 0.15f);
+        path.lineTo(cx + w * 0.5f, cy + h * 0.5f);
+        path.close();
+        c.drawPath(path, p);
+    }
+
+    // ── 中央出牌区（我方）──
+    private void drawCenterPlays(Canvas c, int w, int h) {
         List<Card> tc = tableCards[GameState.SEAT_ME];
         if (tc.isEmpty()) return;
 
-        float cw = w * 0.078f;
+        float base = Math.min(w, h);
+        float cw = base * 0.072f;
         float ch = cw / CardPainter.ASPECT;
-        float ov = cw * 0.42f;
+        float ov = cw * 0.46f;
         int n = tc.size();
-        float totalW = cw + ov * (n - 1);
-        float startX = (w - totalW) / 2f;
-        float y = h * 0.55f;
+        float tw = cw + ov * (n - 1);
+        float x0 = (w - tw) / 2f;
+        float y = h * 0.545f;
 
         for (int i = 0; i < n; i++) {
-            rect.set(startX + i * ov, y, startX + i * ov + cw, y + ch);
-            painter.drawFace(c, rect, tc.get(i), 5f, false);
+            rc.set(x0 + i * ov, y, x0 + i * ov + cw, y + ch);
+            painter.drawFace(c, rc, tc.get(i), cw * 0.11f, false);
         }
     }
 
-    /** 我的手牌 */
+    // ── 我的手牌 ──
     private void drawMyHand(Canvas c, int w, int h) {
         if (myHand.isEmpty()) return;
 
         for (int i = 0; i < handRects.size() && i < myHand.size(); i++) {
-            RectF r = handRects.get(i);
             boolean sel = selected.contains(Integer.valueOf(i));
-            painter.drawFace(c, r, myHand.get(i), sel ? 10f : 5f, sel);
+            painter.drawFace(c, handRects.get(i), myHand.get(i),
+                    cardH * 0.045f, sel);
         }
 
-        // 已选提示
         if (!selected.isEmpty()) {
-            textPaint.setTypeface(NORMAL);
-            textPaint.setTextAlign(Paint.Align.CENTER);
-            textPaint.setColor(Theme.alpha(theme.accent, 0.92f));
-            textPaint.setTextSize(cardH * 0.20f);
+            txt.setTypeface(F_BOLD);
+            txt.setTextAlign(Paint.Align.CENTER);
+            txt.setTextSize(cardH * 0.155f);
+            txt.setColor(theme.gold);
             c.drawText("已选 " + selected.size() + " 张",
-                    w / 2f, handTopY - cardH * 0.10f, textPaint);
+                    w / 2f, handTopY - cardH * 0.10f, txt);
         }
     }
 
-    /** 气泡 */
+    // ── 气泡 ──
     private void drawBubbles(Canvas c, int w, int h) {
+        float base = Math.min(w, h);
         for (int seat = 0; seat < 3; seat++) {
-            if (bubbles[seat] == null || bubbleAlpha[seat] <= 0.01f) continue;
+            if (bubbles[seat] == null || bubbleA[seat] <= 0.02f) continue;
 
             float cx, cy;
             if (seat == GameState.SEAT_LEFT) {
-                cx = w * 0.22f;
-                cy = h * 0.32f;
+                cx = base * 0.27f;
+                cy = h * 0.42f;
             } else if (seat == GameState.SEAT_RIGHT) {
-                cx = w * 0.78f;
-                cy = h * 0.32f;
+                cx = w - base * 0.27f;
+                cy = h * 0.42f;
             } else {
                 cx = w * 0.5f;
-                cy = h * 0.47f;
+                cy = h * 0.455f;
             }
 
-            textPaint.setTextSize(w * 0.048f);
-            textPaint.setTypeface(BOLD);
-            textPaint.setTextAlign(Paint.Align.CENTER);
+            txt.setTypeface(F_BOLD);
+            txt.setTextSize(base * 0.046f);
+            txt.setTextAlign(Paint.Align.CENTER);
 
-            float tw = textPaint.measureText(bubbles[seat]);
-            float padH = w * 0.030f;
-            float padV = w * 0.020f;
-            float bw = tw + padH * 2;
-            float bh = w * 0.048f + padV * 2;
-            float by = cy - bh / 2;
+            float tw = txt.measureText(bubbles[seat]);
+            float ph = base * 0.030f;
+            float pv = base * 0.018f;
+            float bw = tw + ph * 2;
+            float bh = base * 0.046f + pv * 2;
+            float by = cy - bh / 2f;
 
-            rect2.set(cx - bw / 2, by, cx + bw / 2, by + bh);
+            rc2.set(cx - bw / 2f, by, cx + bw / 2f, by + bh);
 
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Theme.alpha(theme.panelBg, 0.94f * bubbleAlpha[seat]));
-            c.drawRoundRect(rect2, bh / 2, bh / 2, paint);
+            // 阴影
+            rc.set(rc2);
+            rc.offset(0, bh * 0.10f);
+            p.setColor(0x44000000);
+            c.drawRoundRect(rc, bh / 2f, bh / 2f, p);
 
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(w * 0.0035f);
-            paint.setColor(Theme.alpha(theme.accent, 0.55f * bubbleAlpha[seat]));
-            c.drawRoundRect(rect2, bh / 2, bh / 2, paint);
-            paint.setStyle(Paint.Style.FILL);
+            // 底
+            p.setColor(Theme.alpha(0xF5101A24, bubbleA[seat]));
+            c.drawRoundRect(rc2, bh / 2f, bh / 2f, p);
 
-            textPaint.setColor(Theme.alpha(theme.textPrimary, bubbleAlpha[seat]));
-            c.drawText(bubbles[seat], cx, by + bh / 2 + w * 0.017f, textPaint);
+            // 边
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(base * 0.0032f);
+            p.setColor(Theme.alpha(theme.gold, 0.62f * bubbleA[seat]));
+            c.drawRoundRect(rc2, bh / 2f, bh / 2f, p);
+            p.setStyle(Paint.Style.FILL);
+
+            txt.setColor(Theme.alpha(0xFFFFFFFF, bubbleA[seat]));
+            c.drawText(bubbles[seat], cx, by + bh / 2f + base * 0.016f, txt);
         }
     }
 
-    private void updateAnimations() {
+    private void tickAnimations() {
         long now = System.currentTimeMillis();
+
         for (int i = 0; i < 3; i++) {
-            if (bubbleTime[i] <= 0) continue;
-            long el = now - bubbleTime[i];
-            final long HOLD = 1100;
-            final long FADE = 420;
-            if (el < HOLD) {
-                bubbleAlpha[i] = 1f;
-            } else if (el < HOLD + FADE) {
-                bubbleAlpha[i] = 1f - (el - HOLD) / (float) FADE;
+            if (bubbleAt[i] > 0) {
+                long el = now - bubbleAt[i];
+                final long HOLD = 1000, FADE = 400;
+                if (el < HOLD) bubbleA[i] = 1f;
+                else if (el < HOLD + FADE) bubbleA[i] = 1f - (el - HOLD) / (float) FADE;
+                else { bubbleA[i] = 0f; bubbles[i] = null; bubbleAt[i] = 0; }
+            }
+            // 思考脉冲
+            if (activeSeat == i && i != GameState.SEAT_ME) {
+                thinkA[i] += (1f - thinkA[i]) * 0.15f;
+                if (thinkA[i] > 0.97f) thinkA[i] = 0.15f;   // 循环
             } else {
-                bubbleAlpha[i] = 0f;
-                bubbles[i] = null;
-                bubbleTime[i] = 0;
+                thinkA[i] *= 0.85f;
             }
         }
     }
 
     // ============================================================
-    //                 布局与触摸
+    //                      手牌布局
     // ============================================================
 
     private void layoutHand() {
-        int w = getWidth();
-        int h = getHeight();
+        int w = getWidth(), h = getHeight();
         if (w == 0 || h == 0) return;
 
         handRects.clear();
         int n = myHand.size();
         if (n == 0) return;
 
-        // 手牌区高度占比
-        float areaH = h * 0.30f;
+        float base = Math.min(w, h);
+        float areaH = base * 0.285f;      // 手牌区高度
         handTopY = h - areaH;
 
-        cardH = areaH * 0.76f;
+        cardH = areaH * 0.80f;
         cardW = cardH * CardPainter.ASPECT;
-        liftY = areaH * 0.16f;
+        liftY = areaH * 0.22f;
 
-        // 根据张数决定步进
-        float available = w - cardW * 0.55f;
-        float ideal = cardW * 0.58f;
+        float avail = w - base * 0.10f;
+        float ideal = cardW * 0.56f;
         stepX = ideal;
+
         if (n > 1) {
             float need = ideal * (n - 1) + cardW;
-            if (need > available) {
-                stepX = (available - cardW) / (n - 1);
-                float min = cardW * 0.22f;
-                if (stepX < min) {
-                    stepX = min;
-                }
+            if (need > avail) {
+                stepX = (avail - cardW) / (n - 1);
+                float min = cardW * 0.24f;
+                if (stepX < min) stepX = min;
             }
         }
 
-        float totalW = stepX * (n - 1) + cardW;
-        if (totalW > w) {
-            float s = w / totalW;
+        float total = stepX * (n - 1) + cardW;
+        if (total > w - base * 0.04f) {
+            float s = (w - base * 0.04f) / total;
             cardW *= s;
             cardH *= s;
             stepX *= s;
-            totalW = stepX * (n - 1) + cardW;
+            total = stepX * (n - 1) + cardW;
         }
 
-        float startX = (w - totalW) / 2f;
-        float baseY = h - cardH - h * 0.012f;
+        float x0 = (w - total) / 2f;
+        float yBase = h - cardH - base * 0.020f;
 
         for (int i = 0; i < n; i++) {
             boolean sel = selected.contains(Integer.valueOf(i));
-            float x = startX + stepX * i;
-            float y = baseY - (sel ? liftY : 0);
+            float x = x0 + stepX * i;
+            float y = yBase - (sel ? liftY : 0);
             handRects.add(new RectF(x, y, x + cardW, y + cardH));
         }
     }
 
+    // ============================================================
+    //                      触摸
+    // ============================================================
+
     private boolean dragging = false;
-    private float lastX = 0f;
-    private int dragBaseIdx = -1;
+    private int dragFrom = -1;
     private boolean dragMode = true;
 
     @Override
     public boolean onTouchEvent(MotionEvent e) {
-        int w = getWidth();
-        int h = getHeight();
         float x = e.getX(), y = e.getY();
 
         switch (e.getActionMasked()) {
@@ -567,10 +656,9 @@ public class TableView extends SurfaceView implements SurfaceHolder.Callback, Ru
                 int idx = hitTest(x, y);
                 if (idx >= 0) {
                     dragging = true;
-                    dragBaseIdx = idx;
-                    lastX = x;
+                    dragFrom = idx;
                     dragMode = !selected.contains(Integer.valueOf(idx));
-                    toggleSelection(idx, dragMode);
+                    toggle(idx, dragMode);
                     return true;
                 }
                 if (listener != null) listener.onEmptyTapped();
@@ -579,9 +667,9 @@ public class TableView extends SurfaceView implements SurfaceHolder.Callback, Ru
             case MotionEvent.ACTION_MOVE: {
                 if (!dragging) return true;
                 int idx = hitTest(x, y);
-                if (idx >= 0 && dragBaseIdx >= 0) {
-                    int lo = Math.min(dragBaseIdx, idx);
-                    int hi = Math.max(dragBaseIdx, idx);
+                if (idx >= 0 && dragFrom >= 0) {
+                    int lo = Math.min(dragFrom, idx);
+                    int hi = Math.max(dragFrom, idx);
                     boolean changed = false;
                     for (int i = lo; i <= hi; i++) {
                         boolean has = selected.contains(Integer.valueOf(i));
@@ -591,56 +679,38 @@ public class TableView extends SurfaceView implements SurfaceHolder.Callback, Ru
                             changed = true;
                         }
                     }
-                    if (changed) {
-                        layoutHand();
-                        layoutRefresh();
-                    }
+                    if (changed) layoutHand();
                 }
-                lastX = x;
                 return true;
             }
             case MotionEvent.ACTION_UP:
-            case MotionEvent.ACTION_CANCEL: {
-                if (dragging) {
-                    dragging = false;
-                    dragBaseIdx = -1;
-                }
+            case MotionEvent.ACTION_CANCEL:
+                dragging = false;
+                dragFrom = -1;
                 return true;
-            }
         }
         return super.onTouchEvent(e);
     }
 
-    private void toggleSelection(int idx, boolean on) {
-        Integer key = Integer.valueOf(idx);
+    private void toggle(int idx, boolean on) {
+        Integer k = Integer.valueOf(idx);
         if (on) {
-            if (!selected.contains(key)) selected.add(key);
+            if (!selected.contains(k)) selected.add(k);
         } else {
-            selected.remove(key);
+            selected.remove(k);
         }
         layoutHand();
-        layoutRefresh();
         if (listener != null) listener.onCardTapped(idx);
     }
 
-    /** 触发重排（选中状态变化后牌位会移动） */
-    private void layoutRefresh() {
-        // layoutHand 已重建 rect，无需额外操作
-    }
-
-    /** 命中测试：从右往左，上层优先 */
     private int hitTest(float x, float y) {
         for (int i = handRects.size() - 1; i >= 0; i--) {
             RectF r = handRects.get(i);
-            // 选中上移后，下方空间依然可点
-            if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom + liftY) {
+            if (x >= r.left && x <= r.right
+                    && y >= r.top && y <= r.bottom + liftY) {
                 return i;
             }
         }
         return -1;
-    }
-
-    public void refreshLayout() {
-        layoutHand();
     }
 }

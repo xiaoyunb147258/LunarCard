@@ -1,8 +1,11 @@
 package com.lunar.ddz;
 
 import android.app.Activity;
+import android.content.DialogInterface;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -17,14 +20,17 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.lunar.ddz.ai.LlmBrain;
 import com.lunar.ddz.core.Card;
 import com.lunar.ddz.core.Combo;
 import com.lunar.ddz.core.Controller;
-import com.lunar.ddz.core.Deck;
 import com.lunar.ddz.core.GameState;
 import com.lunar.ddz.data.Prefs;
+import com.lunar.ddz.net.LlmClient;
+import com.lunar.ddz.net.LlmConfig;
 import com.lunar.ddz.ui.Dialogs;
 import com.lunar.ddz.ui.PillButton;
+import com.lunar.ddz.ui.SettingsDialog;
 import com.lunar.ddz.ui.Theme;
 import com.lunar.ddz.view.TableView;
 
@@ -32,34 +38,40 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 主界面。负责把 Controller（逻辑）和 TableView（画面）粘起来。
+ * 主界面 —— 横屏斗地主。
+ *
+ * 布局（横屏）：
+ *   顶部左：积分 / 胜率          顶部右：AI 设置 / 菜单
+ *   中间：牌桌
+ *   底部靠手牌上方：操作按钮（出牌/不要/提示/叫分）
  */
 public class MainActivity extends Activity
         implements Controller.Events, TableView.Listener {
 
     private Prefs prefs;
     private Theme theme;
+    private LlmConfig llmConfig;
+    private LlmClient llmClient;
+
     private Controller controller;
 
     private FrameLayout root;
     private TableView table;
 
     private TextView statsText;
+    private TextView aiBadge;
     private LinearLayout actionBar;
     private LinearLayout bidBar;
 
     private PillButton btnHint, btnPass, btnPlay;
     private PillButton btnBid0, btnBid1, btnBid2, btnBid3;
-    private PillButton btnMenu;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
+
     private final Runnable ticker = new Runnable() {
-        @Override
-        public void run() {
+        @Override public void run() {
             if (controller != null) {
-                long now = System.currentTimeMillis();
-                // 一次 tick 最多执行 1 个 AI 动作，保证节奏自然
-                controller.tick(now);
+                controller.tick(System.currentTimeMillis());
             }
             ui.postDelayed(this, 100);
         }
@@ -75,31 +87,33 @@ public class MainActivity extends Activity
 
         prefs = new Prefs(this);
         theme = Theme.of(prefs.skin());
+        llmConfig = new LlmConfig(this);
+        llmClient = new LlmClient(llmConfig);
 
         setupWindow();
         buildUi();
+        startNewGame();
+        ui.post(ticker);
 
         if (!prefs.tutorialShown()) {
             prefs.setTutorialShown();
             ui.postDelayed(new Runnable() {
                 @Override public void run() { showTutorial(); }
-            }, 600);
+            }, 500);
         }
-
-        startNewGame();
-        ui.post(ticker);
     }
 
     private void setupWindow() {
         Window w = getWindow();
+        w.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
         if (Build.VERSION.SDK_INT >= 21) {
-            w.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
             w.setStatusBarColor(Color.TRANSPARENT);
-            w.setNavigationBarColor(theme.tableBottom);
+            w.setNavigationBarColor(Color.TRANSPARENT);
         }
         w.getDecorView().setSystemUiVisibility(
                 View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
+                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
         try {
             if (Build.VERSION.SDK_INT >= 28) {
                 WindowManager.LayoutParams lp = w.getAttributes();
@@ -114,19 +128,31 @@ public class MainActivity extends Activity
     protected void onDestroy() {
         super.onDestroy();
         ui.removeCallbacksAndMessages(null);
+        if (llmClient != null) llmClient.shutdown();
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration cfg) {
+        super.onConfigurationChanged(cfg);
+        if (table != null) table.refreshLayout();
     }
 
     // ============================================================
-    //                      UI 构建
+    //                      UI 构建（横屏）
     // ============================================================
 
+    private float dp() {
+        return getResources().getDisplayMetrics().density;
+    }
+
     private void buildUi() {
-        float d = getResources().getDisplayMetrics().density;
+        float d = dp();
 
         root = new FrameLayout(this);
-        root.setBackgroundColor(theme.tableBottom);
+        root.setBackgroundColor(theme.feltBottom);
         setContentView(root);
 
+        // 牌桌铺满
         table = new TableView(this);
         table.setTheme(theme);
         table.setListener(this);
@@ -134,46 +160,64 @@ public class MainActivity extends Activity
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // ---- 顶部信息条 ----
-        LinearLayout topBar = new LinearLayout(this);
-        topBar.setOrientation(LinearLayout.HORIZONTAL);
-        topBar.setGravity(Gravity.CENTER_VERTICAL);
-        topBar.setPadding((int) (14 * d), (int) (10 * d), (int) (10 * d), 0);
-
+        // ── 顶部左：统计 ──
         statsText = new TextView(this);
-        statsText.setTextColor(theme.textSecondary);
+        statsText.setTextColor(0xCCFFFFFF);
         statsText.setTextSize(12.5f);
         statsText.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        topBar.addView(statsText, slp);
+        statsText.setShadowLayer(3f, 0f, 1.5f, 0xCC000000);
+        FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        slp.gravity = Gravity.TOP | Gravity.START;
+        slp.leftMargin = (int) (20 * d);
+        slp.topMargin = (int) (14 * d);
+        root.addView(statsText, slp);
 
-        btnMenu = new PillButton(this);
-        btnMenu.setTheme(theme);
-        btnMenu.setLabel("菜单");
-        btnMenu.setStyle(PillButton.SECONDARY);
-        btnMenu.setTextSizePx(13f * d);
-        btnMenu.setOnClickListener(new View.OnClickListener() {
+        // ── 顶部右：按钮组 ──
+        LinearLayout topRight = new LinearLayout(this);
+        topRight.setOrientation(LinearLayout.HORIZONTAL);
+        topRight.setGravity(Gravity.CENTER_VERTICAL);
+
+        aiBadge = new TextView(this);
+        aiBadge.setTextSize(11.5f);
+        aiBadge.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        aiBadge.setPadding((int) (10 * d), (int) (5 * d), (int) (10 * d), (int) (5 * d));
+        GradientDrawable badgeBg = new GradientDrawable();
+        badgeBg.setCornerRadius(20 * d);
+        badgeBg.setStroke((int) (1 * d), 0x66FFFFFF);
+        badgeBg.setColor(0x55000000);
+        aiBadge.setBackground(badgeBg);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        blp.rightMargin = (int) (8 * d);
+        topRight.addView(aiBadge, blp);
+
+        PillButton btnAi = topBtn("AI", new View.OnClickListener() {
+            @Override public void onClick(View v) { openAiSettings(); }
+        });
+        PillButton btnMenu = topBtn("菜单", new View.OnClickListener() {
             @Override public void onClick(View v) { showMenu(); }
         });
-        topBar.addView(btnMenu, new LinearLayout.LayoutParams(
-                (int) (64 * d), (int) (34 * d)));
+        topRight.addView(btnAi);
+        topRight.addView(btnMenu);
 
-        FrameLayout.LayoutParams tlp = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
+        FrameLayout.LayoutParams trp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
-        tlp.gravity = Gravity.TOP;
-        root.addView(topBar, tlp);
+        trp.gravity = Gravity.TOP | Gravity.END;
+        trp.rightMargin = (int) (16 * d);
+        trp.topMargin = (int) (10 * d);
+        root.addView(topRight, trp);
 
-        // ---- 操作按钮条 ----
+        // ── 操作按钮条（手牌上方）──
         actionBar = new LinearLayout(this);
         actionBar.setOrientation(LinearLayout.HORIZONTAL);
         actionBar.setGravity(Gravity.CENTER);
-        actionBar.setPadding(0, 0, 0, (int) (6 * d));
 
-        btnHint = makeActionBtn("提示", PillButton.SECONDARY, 0.92f);
-        btnPass = makeActionBtn("不要", PillButton.SECONDARY, 1.02f);
-        btnPlay = makeActionBtn("出牌", PillButton.PRIMARY, 1.20f);
+        btnHint = actionBtn("提示", PillButton.SECONDARY, 1.00f);
+        btnPass = actionBtn("不要", PillButton.SECONDARY, 1.10f);
+        btnPlay = actionBtn("出牌", PillButton.PRIMARY, 1.35f);
 
         actionBar.addView(btnHint);
         actionBar.addView(btnPass);
@@ -190,22 +234,21 @@ public class MainActivity extends Activity
         });
 
         FrameLayout.LayoutParams alp = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
-        alp.gravity = Gravity.BOTTOM;
-        alp.bottomMargin = (int) (getResources().getDisplayMetrics().heightPixels * 0.295f);
+        alp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        alp.bottomMargin = (int) (96 * d);
         root.addView(actionBar, alp);
 
-        // ---- 叫分条 ----
+        // ── 叫分条 ──
         bidBar = new LinearLayout(this);
         bidBar.setOrientation(LinearLayout.HORIZONTAL);
         bidBar.setGravity(Gravity.CENTER);
-        bidBar.setPadding(0, 0, 0, (int) (6 * d));
 
-        btnBid0 = makeActionBtn("不叫", PillButton.SECONDARY, 1.0f);
-        btnBid1 = makeActionBtn("1 分", PillButton.SECONDARY, 0.88f);
-        btnBid2 = makeActionBtn("2 分", PillButton.SECONDARY, 0.88f);
-        btnBid3 = makeActionBtn("3 分", PillButton.PRIMARY, 0.96f);
+        btnBid0 = actionBtn("不叫", PillButton.SECONDARY, 1.05f);
+        btnBid1 = actionBtn("1 分", PillButton.SECONDARY, 0.95f);
+        btnBid2 = actionBtn("2 分", PillButton.SECONDARY, 0.95f);
+        btnBid3 = actionBtn("3 分", PillButton.PRIMARY, 1.05f);
 
         bidBar.addView(btnBid0);
         bidBar.addView(btnBid1);
@@ -225,21 +268,37 @@ public class MainActivity extends Activity
             @Override public void onClick(View v) { humanBid(3); }
         });
 
-        FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
+        FrameLayout.LayoutParams blp2 = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
-        blp.gravity = Gravity.BOTTOM;
-        blp.bottomMargin = (int) (getResources().getDisplayMetrics().heightPixels * 0.295f);
-        root.addView(bidBar, blp);
+        blp2.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        blp2.bottomMargin = (int) (96 * d);
+        root.addView(bidBar, blp2);
 
         actionBar.setVisibility(View.GONE);
         bidBar.setVisibility(View.GONE);
 
         refreshStats();
+        refreshAiBadge();
     }
 
-    private PillButton makeActionBtn(String label, int style, float scale) {
-        float d = getResources().getDisplayMetrics().density;
+    private PillButton topBtn(String label, View.OnClickListener l) {
+        float d = dp();
+        PillButton b = new PillButton(this);
+        b.setTheme(theme);
+        b.setLabel(label);
+        b.setStyle(PillButton.SECONDARY);
+        b.setTextSizePx(12.5f * d);
+        b.setOnClickListener(l);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                (int) (58 * d), (int) (32 * d));
+        lp.leftMargin = (int) (6 * d);
+        b.setLayoutParams(lp);
+        return b;
+    }
+
+    private PillButton actionBtn(String label, int style, float scale) {
+        float d = dp();
         PillButton b = new PillButton(this);
         b.setTheme(theme);
         b.setLabel(label);
@@ -247,48 +306,70 @@ public class MainActivity extends Activity
         b.setTextSizePx(15f * d);
 
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                (int) (86 * d * scale), (int) (46 * d));
-        lp.setMargins((int) (5 * d), 0, (int) (5 * d), 0);
+                (int) (92 * d * scale), (int) (48 * d));
+        lp.setMargins((int) (6 * d), 0, (int) (6 * d), 0);
         b.setLayoutParams(lp);
         return b;
     }
 
-    private void applyTheme() {
-        table.setTheme(theme);
-        root.setBackgroundColor(theme.tableBottom);
-        statsText.setTextColor(theme.textSecondary);
+    private void refreshStats() {
+        statsText.setText("积分 " + prefs.score()
+                + "  ·  胜率 " + prefs.winRate() + "%"
+                + "  ·  连胜 " + prefs.curStreak());
+    }
 
-        btnMenu.setTheme(theme);
-        btnHint.setTheme(theme);
-        btnPass.setTheme(theme);
-        btnPlay.setTheme(theme);
-        btnBid0.setTheme(theme);
-        btnBid1.setTheme(theme);
-        btnBid2.setTheme(theme);
-        btnBid3.setTheme(theme);
-
-        if (Build.VERSION.SDK_INT >= 21) {
-            getWindow().setNavigationBarColor(theme.tableBottom);
+    private void refreshAiBadge() {
+        if (llmConfig.isUsable()) {
+            aiBadge.setText("大模型");
+            aiBadge.setTextColor(theme.gold);
+        } else {
+            aiBadge.setText("本地AI");
+            aiBadge.setTextColor(0xFFB9D4C5);
         }
     }
 
-    private void refreshStats() {
-        statsText.setText("积分 " + prefs.score()
-                + "  胜率 " + prefs.winRate() + "%"
-                + "  连胜 " + prefs.curStreak());
-    }
-
     // ============================================================
-    //                     开局
+    //                      开局
     // ============================================================
 
     private void startNewGame() {
-        if (controller != null) {
-            // 丢弃旧控制器（无异步资源需要释放）
-        }
         long seed = System.nanoTime() ^ (System.currentTimeMillis() << 13);
         controller = new Controller(prefs.difficulty(), seed);
         controller.setEvents(this);
+
+        // 如果配置了 AI，接入外部大脑
+        if (llmConfig.isUsable()) {
+            final LlmBrain[] brains = new LlmBrain[3];
+            for (int s = 1; s <= 2; s++) {
+                brains[s] = new LlmBrain(s, llmClient, prefs.difficulty(),
+                        personaFor(s));
+            }
+            controller.setExternalBrain(new Controller.ExternalBrain() {
+                @Override
+                public void decide(int seat, GameState gs,
+                                   Controller.DecisionCallback cb) {
+                    if (seat < 1 || seat > 2 || brains[seat] == null) {
+                        cb.onDecided(null);
+                        return;
+                    }
+                    final Controller.DecisionCallback fcb = cb;
+                    brains[seat].decide(gs, new LlmBrain.OnDecided() {
+                        @Override
+                        public void onDecided(List<Card> cards, boolean fromLlm) {
+                            fcb.onDecided(cards);
+                        }
+                    });
+                }
+
+                @Override
+                public int bid(int seat, List<Card> hand, int highest) {
+                    if (seat < 1 || seat > 2 || brains[seat] == null) return 0;
+                    return brains[seat].decideBid(hand, highest);
+                }
+            });
+        } else {
+            controller.setExternalBrain(null);
+        }
 
         table.bindState(controller.state());
         table.clearTableCards();
@@ -304,8 +385,15 @@ public class MainActivity extends Activity
         controller.start();
     }
 
+    private String personaFor(int seat) {
+        switch (seat) {
+            case GameState.SEAT_RIGHT: return "稳健老练，善于控场";
+            default: return "思路灵活，喜欢抢先";
+        }
+    }
+
     // ============================================================
-    //                   Controller.Events
+    //                  Controller.Events
     // ============================================================
 
     @Override
@@ -321,7 +409,7 @@ public class MainActivity extends Activity
     }
 
     @Override
-    public void onBidTurn(final int seat) {
+    public void onBidTurn(int seat) {
         table.setActiveSeat(seat);
         if (seat == GameState.SEAT_ME) {
             bidBar.setVisibility(View.VISIBLE);
@@ -338,10 +426,7 @@ public class MainActivity extends Activity
 
     @Override
     public void onBidDone(int seat, int score) {
-        String txt;
-        if (score == 0) txt = "不叫";
-        else txt = score + " 分";
-        table.showBubble(seat, txt);
+        table.showBubble(seat, score == 0 ? "不叫" : score + " 分");
         if (seat == GameState.SEAT_ME) bidBar.setVisibility(View.GONE);
     }
 
@@ -353,11 +438,7 @@ public class MainActivity extends Activity
         table.setHand(gs.hands[GameState.SEAT_ME]);
         for (int i = 0; i < 3; i++) table.setRemain(i, gs.hands[i].size());
 
-        if (seat == GameState.SEAT_ME) {
-            table.showBubble(seat, "我是地主");
-        } else {
-            table.showBubble(seat, "地主");
-        }
+        table.showBubble(seat, seat == GameState.SEAT_ME ? "我是地主" : "地主");
     }
 
     @Override
@@ -384,10 +465,9 @@ public class MainActivity extends Activity
             table.clearSelection();
             actionBar.setVisibility(View.GONE);
         }
-
         Combo c = Combo.analyze(cards);
         if (c != null && c.isBombKind()) {
-            table.showBubble(seat, c.typeName() + "！");
+            table.showBubble(seat, c.typeName() + "!");
         }
     }
 
@@ -399,18 +479,14 @@ public class MainActivity extends Activity
     @Override
     public void onTableClear() {
         ui.postDelayed(new Runnable() {
-            @Override public void run() {
-                table.clearTableCards();
-            }
+            @Override public void run() { table.clearTableCards(); }
         }, 480);
     }
 
     @Override
     public void onPlayerCountsChanged() {
         GameState gs = controller.state();
-        for (int i = 0; i < 3; i++) {
-            table.setRemain(i, gs.hands[i].size());
-        }
+        for (int i = 0; i < 3; i++) table.setRemain(i, gs.hands[i].size());
     }
 
     @Override
@@ -433,7 +509,7 @@ public class MainActivity extends Activity
             @Override public void run() {
                 showResult(win, delta, mult, bombs, spring);
             }
-        }, 700);
+        }, 650);
     }
 
     @Override
@@ -447,30 +523,23 @@ public class MainActivity extends Activity
     }
 
     @Override
-    public void onMessage(String msg) {
-        toast(msg);
-    }
+    public void onMessage(String msg) { toast(msg); }
 
     // ============================================================
-    //                   TableView.Listener
+    //                  TableView.Listener
     // ============================================================
 
     @Override
-    public void onCardTapped(int index) {
-        updateActionButtons();
-    }
-
-    @Override
-    public void onHandScrolled(float dx) {
-        // 预留
-    }
+    public void onCardTapped(int index) { updateActionButtons(); }
 
     @Override
     public void onEmptyTapped() {
         table.clearSelection();
-        table.refreshLayout();
         updateActionButtons();
     }
+
+    @Override
+    public void onAnimationSettled() {}
 
     // ============================================================
     //                      玩家操作
@@ -485,44 +554,28 @@ public class MainActivity extends Activity
     private void doPlay() {
         if (controller == null) return;
         List<Card> sel = table.getSelectedCards();
-        if (sel.isEmpty()) {
-            toast("请先选牌");
-            return;
-        }
+        if (sel.isEmpty()) { toast("请先选牌"); return; }
+
         int r = controller.humanPlay(sel);
         switch (r) {
             case GameState.PLAY_OK:
                 table.clearSelection();
-                table.refreshLayout();
                 actionBar.setVisibility(View.GONE);
                 break;
-            case GameState.PLAY_INVALID_COMBO:
-                toast("牌型不合法");
-                break;
-            case GameState.PLAY_CANNOT_BEAT:
-                toast("压不过上家");
-                break;
-            case GameState.PLAY_CARD_NOT_IN_HAND:
-                toast("手牌状态异常");
-                break;
-            case GameState.PLAY_NOT_YOUR_TURN:
-                toast("还没轮到你");
-                break;
-            default:
-                break;
+            case GameState.PLAY_INVALID_COMBO: toast("牌型不合法"); break;
+            case GameState.PLAY_CANNOT_BEAT: toast("压不过上家"); break;
+            case GameState.PLAY_CARD_NOT_IN_HAND: toast("手牌状态异常"); break;
+            case GameState.PLAY_NOT_YOUR_TURN: toast("还没轮到你"); break;
+            default: break;
         }
     }
 
     private void doPass() {
         if (controller == null) return;
         int r = controller.humanPass();
-        if (r == GameState.PLAY_CANNOT_PASS) {
-            toast("自由出牌，必须出一手");
-            return;
-        }
+        if (r == GameState.PLAY_CANNOT_PASS) { toast("自由出牌，必须出一手"); return; }
         if (r == GameState.PLAY_OK) {
             table.clearSelection();
-            table.refreshLayout();
             actionBar.setVisibility(View.GONE);
         }
     }
@@ -530,15 +583,11 @@ public class MainActivity extends Activity
     private void doHint() {
         if (controller == null) return;
         List<Card> h = controller.hintForMe();
-        if (h == null || h.isEmpty()) {
-            toast("没有能压过的牌，建议「不要」");
-            return;
-        }
+        if (h == null || h.isEmpty()) { toast("没有能压过的牌，建议「不要」"); return; }
         table.selectCards(h);
         updateActionButtons();
     }
 
-    /** 根据当前选中更新按钮文字与可用性 */
     private void updateActionButtons() {
         List<Card> sel = table.getSelectedCards();
         GameState gs = controller.state();
@@ -549,54 +598,44 @@ public class MainActivity extends Activity
         btnPass.setEnabled(myTurn && controller.canPass());
         btnHint.setEnabled(myTurn);
 
-        if (!myTurn) {
-            btnPlay.setEnabled(false);
-            btnPlay.setLabel("出牌");
-            return;
-        }
-
-        if (sel.isEmpty()) {
-            btnPlay.setLabel("出牌");
-            btnPlay.setEnabled(false);
-            return;
-        }
+        if (!myTurn) { btnPlay.setEnabled(false); btnPlay.setLabel("出牌"); return; }
+        if (sel.isEmpty()) { btnPlay.setLabel("出牌"); btnPlay.setEnabled(false); return; }
 
         Combo c = Combo.analyze(sel);
-        if (c == null) {
-            btnPlay.setLabel("牌型错误");
-            btnPlay.setEnabled(false);
-            return;
-        }
+        if (c == null) { btnPlay.setLabel("牌型错误"); btnPlay.setEnabled(false); return; }
 
         Combo prev = gs.pendingCombo();
         boolean ok = (prev == null) || Combo.canBeat(prev, c);
 
-        if (!ok) {
-            btnPlay.setLabel("压不过");
-            btnPlay.setEnabled(false);
-        } else {
-            btnPlay.setLabel(c.typeName());
-            btnPlay.setEnabled(true);
-        }
+        if (!ok) { btnPlay.setLabel("压不过"); btnPlay.setEnabled(false); }
+        else { btnPlay.setLabel(c.typeName()); btnPlay.setEnabled(true); }
     }
 
     // ============================================================
     //                       弹窗
     // ============================================================
 
+    private void openAiSettings() {
+        SettingsDialog.show(this, theme, llmConfig, llmClient, new Runnable() {
+            @Override
+            public void run() {
+                refreshAiBadge();
+                toast(llmConfig.isUsable()
+                        ? "AI 已切换为大模型（下局生效）"
+                        : "AI 已切换为本地算法（下局生效）");
+            }
+        });
+    }
+
     private void showResult(boolean win, int delta, int mult, int bombs, boolean spring) {
         GameState gs = controller.state();
-
         StringBuilder sb = new StringBuilder();
-        sb.append(win ? "你赢了这局" : "这局输了").append("\n\n");
+        sb.append(win ? "你赢了这局" : "这局输了").append("\n");
         sb.append("本局得分：").append(delta > 0 ? "+" : "").append(delta).append("\n");
-        sb.append("底分 ").append(gs.baseScore)
-                .append("　总倍数 ×").append(mult).append("\n");
-        if (bombs > 0) sb.append("炸弹 ").append(bombs).append(" 个\n");
-        if (spring) sb.append("春天 额外 ×2\n");
-        sb.append("地主：").append(seatName(gs.landlord)).append("\n");
-        sb.append("赢家：").append(seatName(gs.winner)).append("\n\n");
-        sb.append("累计积分 ").append(prefs.score())
+        sb.append("底分 ").append(gs.baseScore).append("　总倍数 ×").append(mult);
+        if (bombs > 0) sb.append("\n炸弹 ").append(bombs).append(" 个");
+        if (spring) sb.append("\n春天 额外 ×2");
+        sb.append("\n累计积分 ").append(prefs.score())
                 .append("　胜率 ").append(prefs.winRate()).append("%");
 
         Dialogs.show(this, theme,
@@ -605,11 +644,12 @@ public class MainActivity extends Activity
                 new Dialogs.Btn("再来一局", PillButton.PRIMARY, new Runnable() {
                     @Override public void run() { startNewGame(); }
                 }),
-                new Dialogs.Btn("查看牌桌", PillButton.SECONDARY, null));
+                new Dialogs.Btn("看看牌桌", PillButton.SECONDARY, null));
     }
 
     private void showMenu() {
-        String[] items = new String[]{
+        String[] items = {
+                "AI 接口设置",
                 "切换皮肤：" + theme.name,
                 "切换难度：" + diffName(prefs.difficulty()),
                 "重新开局",
@@ -617,25 +657,25 @@ public class MainActivity extends Activity
                 "我的战绩",
                 "重置统计"
         };
-
-        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this);
-        b.setTitle("菜单");
-        b.setItems(items, new android.content.DialogInterface.OnClickListener() {
-            @Override
-            public void onClick(android.content.DialogInterface d, int which) {
-                d.dismiss();
-                switch (which) {
-                    case 0: cycleSkin(); break;
-                    case 1: cycleDifficulty(); break;
-                    case 2: startNewGame(); break;
-                    case 3: showRules(); break;
-                    case 4: showStats(); break;
-                    case 5: confirmReset(); break;
-                    default: break;
-                }
-            }
-        });
-        b.show();
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("菜单")
+                .setItems(items, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        d.dismiss();
+                        switch (which) {
+                            case 0: openAiSettings(); break;
+                            case 1: cycleSkin(); break;
+                            case 2: cycleDifficulty(); break;
+                            case 3: startNewGame(); break;
+                            case 4: showRules(); break;
+                            case 5: showStats(); break;
+                            case 6: confirmReset(); break;
+                            default: break;
+                        }
+                    }
+                })
+                .show();
     }
 
     private String diffName(int d) {
@@ -649,8 +689,9 @@ public class MainActivity extends Activity
     private void cycleSkin() {
         theme = Theme.next(theme);
         prefs.setSkin(theme.id);
-        applyTheme();
-        table.refreshLayout();
+        table.setTheme(theme);
+        root.setBackgroundColor(theme.feltBottom);
+        refreshAiBadge();
         toast("皮肤：" + theme.name);
     }
 
@@ -665,24 +706,20 @@ public class MainActivity extends Activity
                 "【牌型】\n" +
                 "单张 / 对子 / 三张 / 三带一 / 三带二\n" +
                 "顺子：5 张起连续，不含 2 和王\n" +
-                "连对：3 对起连续，不含 2 和王\n" +
+                "连对：3 对起连续\n" +
                 "飞机：连续三张 2 组起，可带单或带对\n" +
                 "四带二 / 四带两对\n" +
-                "炸弹：四张相同；王炸：双王\n\n" +
-                "【大小顺序】\n" +
-                "3 < 4 < 5 < 6 < 7 < 8 < 9 < 10 < J < Q < K < A < 2 < 小王 < 大王\n" +
-                "炸弹可压任意非炸弹，王炸最大\n\n" +
+                "炸弹 / 王炸\n\n" +
+                "【大小】\n" +
+                "3 < 4 < ... < K < A < 2 < 小王 < 大王\n" +
+                "炸弹压任意非炸弹，王炸最大\n\n" +
                 "【计分】\n" +
-                "叫分作为底分，每出一个炸弹 ×2\n" +
-                "春天（农民一张没出）×2\n" +
-                "反春天（地主只出一手）×2\n" +
-                "地主输赢按 2 倍结算，农民按 1 倍\n\n" +
+                "叫分作底分，每炸弹 ×2\n" +
+                "春天 / 反春天 各 ×2\n" +
+                "地主输赢 ×2，农民 ×1\n\n" +
                 "【操作】\n" +
-                "点牌选中 / 再点取消\n" +
-                "横向滑动可连续多选\n" +
-                "点「提示」让系统帮你选一手\n" +
-                "选好后点「出牌」；压不过可点「不要」";
-
+                "点牌选中，横向滑动连选\n" +
+                "「提示」自动选一手合法牌";
         Dialogs.alert(this, theme, "游戏规则", s);
     }
 
@@ -699,39 +736,31 @@ public class MainActivity extends Activity
                 "春天次数：" + prefs.totalSprings() + "\n" +
                 "最高倍数：×" + prefs.bestMultiplier() + "\n\n" +
                 "累计积分：" + prefs.score();
-
         Dialogs.alert(this, theme, "我的战绩", s);
     }
 
     private void confirmReset() {
-        Dialogs.show(this, theme, "重置统计", "所有战绩数据将被清零，确定吗？",
+        Dialogs.show(this, theme, "重置统计", "所有战绩将清零，确定吗？",
                 new Dialogs.Btn("取消", PillButton.SECONDARY, null),
-                new Dialogs.Btn("确定重置", PillButton.DANGER, new Runnable() {
+                new Dialogs.Btn("确定", PillButton.DANGER, new Runnable() {
                     @Override public void run() {
                         prefs.resetStats();
                         refreshStats();
-                        toast("统计已重置");
+                        toast("已重置");
                     }
                 }));
     }
 
     private void showTutorial() {
         String s =
-                "欢迎来到月斗地主。\n\n" +
-                "这是一款纯单机斗地主，三名 AI 各有性格：\n" +
-                "新手会犯错，普通稳健，高手会算牌。\n\n" +
+                "这是一款单机斗地主。\n\n" +
+                "两个对手由 AI 控制，可以在「AI」按钮里接上大模型，\n" +
+                "让它们打得更像真人。不接也能玩，用的是本地算法。\n\n" +
                 "开局先叫分，叫得越高底分越高。\n" +
                 "点牌选中，横向滑动可连选。\n" +
-                "不确定出什么就点「提示」。\n\n" +
-                "祝你好运。";
-
+                "不确定出什么就点「提示」。";
         Dialogs.show(this, theme, "开始游戏", s,
                 new Dialogs.Btn("开始", PillButton.PRIMARY, null));
-    }
-
-    private String seatName(int seat) {
-        if (seat == GameState.SEAT_ME) return "你";
-        return GameState.seatName(seat);
     }
 
     private void toast(String s) {
@@ -743,9 +772,7 @@ public class MainActivity extends Activity
         Dialogs.show(this, theme, "退出游戏", "确定要离开牌桌吗？",
                 new Dialogs.Btn("继续游戏", PillButton.SECONDARY, null),
                 new Dialogs.Btn("退出", PillButton.DANGER, new Runnable() {
-                    @Override public void run() {
-                        finish();
-                    }
+                    @Override public void run() { finish(); }
                 }));
     }
 }

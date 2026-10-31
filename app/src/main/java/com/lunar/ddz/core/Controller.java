@@ -39,6 +39,27 @@ public final class Controller {
     private final BrainedPlayer[] brains = new BrainedPlayer[3];
     private Events events;
 
+    /**
+     * 外部大脑（大模型）。非 null 时优先使用，决策完成后再走 apply。
+     * 由 MainActivity 注入，避免 core 层依赖网络层。
+     */
+    public interface ExternalBrain {
+        /** 请求决策；实现方负责在适当时机回调 */
+        void decide(int seat, GameState gs, DecisionCallback cb);
+        /** 叫分（仍是本地逻辑） */
+        int bid(int seat, List<Card> hand, int highest);
+    }
+
+    public interface DecisionCallback {
+        void onDecided(List<Card> cards);
+    }
+
+    private ExternalBrain external;
+
+    public void setExternalBrain(ExternalBrain b) {
+        this.external = b;
+    }
+
     /** AI 下一次行动的时间戳，0 表示无待办 */
     private long aiActionAt = 0;
     private boolean aiPending = false;
@@ -213,19 +234,51 @@ public final class Controller {
         if (gs.phase == GameState.PHASE_BID) {
             int seat = gs.bidTurn;
             if (seat == GameState.SEAT_ME) return false;
-            int score = brains[seat].bid(gs.hands[seat], gs.highestBid);
+            int score = (external != null)
+                    ? external.bid(seat, gs.hands[seat], gs.highestBid)
+                    : brains[seat].bid(gs.hands[seat], gs.highestBid);
             doBid(seat, score);
             return true;
         }
 
         if (gs.phase == GameState.PHASE_PLAY) {
-            int seat = gs.turn;
+            final int seat = gs.turn;
             if (seat == GameState.SEAT_ME) return false;
+
+            if (external != null) {
+                // 异步路径：请求外部大脑，回调后再生效
+                // 期间把 aiPending 重新挂起，防止重复触发
+                aiPending = true;
+                aiActionAt = now + 60000;   // 最长等 60 秒
+
+                external.decide(seat, gs, new DecisionCallback() {
+                    @Override
+                    public void onDecided(List<Card> cards) {
+                        aiPending = false;
+                        aiActionAt = 0;
+
+                        if (gs.phase != GameState.PHASE_PLAY || gs.turn != seat) {
+                            return;   // 局面已变，丢弃
+                        }
+
+                        if (cards == null || cards.isEmpty()) {
+                            if (gs.isFreePlay(seat)) {
+                                List<Card> fb = fallbackMove(seat);
+                                if (fb != null) applyPlay(seat, fb);
+                            } else {
+                                applyPass(seat);
+                            }
+                            return;
+                        }
+                        applyPlay(seat, cards);
+                    }
+                });
+                return true;
+            }
 
             List<Card> move = brains[seat].decide(gs, seat);
             if (move == null) {
                 if (gs.isFreePlay(seat)) {
-                    // 自由出牌不能过，兜底出最小单张
                     move = fallbackMove(seat);
                 } else {
                     applyPass(seat);
